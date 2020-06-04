@@ -1,5 +1,6 @@
 module Cardano.CLI.Shelley.Run.StakeAddress
   ( ShelleyStakeAddressCmdError
+  , checkKeyPair
   , renderShelleyStakeAddressCmdError
   , runStakeAddressCmd
   ) where
@@ -48,12 +49,12 @@ data ShelleyStakeAddressCmdError
       -- ^ Number of signing keys
   | ShelleyStakeAddressLessKeysThanOutsError
       !Int
-      -- ^ Number of keys
+      -- ^ Number of input keys
       !Int
       -- ^ Number of output file paths
   | ShelleyStakeAddressMoreKeysThanOutsError
       !Int
-      -- ^ Number of keys
+      -- ^ Number of input keys
       !Int
       -- ^ Number of output file paths
   | ShelleyStakeAddressWriteCertError !FilePath !ApiError
@@ -66,8 +67,7 @@ renderShelleyStakeAddressCmdError err =
   case err of
     ShelleyStakeReadPoolOperatorKeyError fp keyErr ->
       "Error reading pool operator key at: " <> textShow fp <> " Error: " <> renderKeyError keyErr
-    ShelleyStakeAddressConvError convErr ->
-      renderConversionError convErr
+    ShelleyStakeAddressConvError convErr -> renderConversionError convErr
     ShelleyStakeAddressReadFileError fp readErr ->
       "Error reading file at: " <> textShow fp <> " Error: " <> readErr
     ShelleyStakeAddressReadVerKeyError fp apiErr ->
@@ -78,25 +78,25 @@ renderShelleyStakeAddressCmdError err =
       "Error while writing signing stake key at: " <> textShow fp <> " Error: " <> renderApiError apiErr
     ShelleyStakeAddressWriteVerKeyError fp apiErr ->
       "Error while writing verification stake key at: " <> textShow fp <> " Error: " <> renderApiError apiErr
-    ShelleyStakeAddressKeyPairError bech32PubKey bech32PrivKey ->
-      "Error while deriving the shelley verification key from: " <> bech32PrivKey <>
+    ShelleyStakeAddressKeyPairError bech32PrivKey bech32PubKey ->
+      "Error while deriving the shelley verification key from bech32 private Key: " <> bech32PrivKey <>
       " Corresponding bech32 public key: " <> bech32PubKey
     ShelleyStakeAddressUnequalKeysError numVKeys numSKeys ->
       "Number of verification keys do not equal number of signing keys:" <>
       " Number of verification keys: " <> textShow numVKeys <>
       " Number of signing keys: " <> textShow numSKeys
-    ShelleyStakeAddressUnequalNumberOfOutputFilesError numOutFiles numSkeys ->
-      "Number of specified output files do not match the number of input keys." <>
-      " Number of output files: " <> textShow numOutFiles <>
-      " Number of key pairs: " <> textShow numSkeys
+    ShelleyStakeAddressUnequalNumberOfOutputFilesError numVKeyOuts numSKeyOuts ->
+      "Number of specified output files are uneven: " <>
+      " Number of verification key output files: " <> textShow numVKeyOuts <>
+      " Number of signing key output files: " <> textShow numSKeyOuts
     ShelleyStakeAddressLessKeysThanOutsError numKeys numOuts ->
-      "Number of input keys are less than the number of specific output files. " <>
+      "Number of input keys are less than the number of specified output files. " <>
       "Number of input keys: " <> textShow numKeys <>
-      "Number of specified output files: " <> textShow numOuts
+      " Number of specified output files: " <> textShow numOuts
     ShelleyStakeAddressMoreKeysThanOutsError numKeys numOuts ->
-      "Number of input keys are more than the number of specific output files. " <>
+      "Number of input keys are more than the number of specified output files. " <>
       "Number of input keys: " <> textShow numKeys <>
-      "Number of specified output files: " <> textShow numOuts
+      " Number of specified output files: " <> textShow numOuts
 
 
 runStakeAddressCmd :: StakeAddressCmd -> ExceptT ShelleyStakeAddressCmdError IO ()
@@ -179,39 +179,104 @@ runStakeKeyITNConversion
   -- ^ Signing key output file paths
   -> ExceptT ShelleyStakeAddressCmdError IO ()
 runStakeKeyITNConversion [] [] [] [] = return ()
+runStakeKeyITNConversion vkeys [] [] [] = do
+  bech32vKeys <- sequenceA [ firstExceptT ShelleyStakeAddressConvError . newExceptT $ readBech32 s
+                           | VerificationKeyFile s <- vkeys
+                           ]
+  verificationKeys <- mapM (hoistEither . first ShelleyStakeAddressConvError . convertITNverificationKey) bech32vKeys
+
+  mapM_ print verificationKeys
+
+runStakeKeyITNConversion vkeys [] vouts [] = do
+  let vKeysNum = length vkeys
+      vOutsNum = length vouts
+
+  equalNumberOfInsOuts vKeysNum vOutsNum
+
+  sequence_ (runSingleITNKeyConversion <$> map Just vkeys <*> (take vOutsNum $ repeat Nothing) <*> vouts)
+
+runStakeKeyITNConversion [] skeys [] [] = do
+  bech32sKeys <- sequenceA [ firstExceptT ShelleyStakeAddressConvError . newExceptT $ readBech32 s
+                           | SigningKeyFile s <- skeys
+                           ]
+  stakingKeys <- mapM (hoistEither . first ShelleyStakeAddressConvError . convertITNsigningKey) bech32sKeys
+
+  mapM_ print stakingKeys
+
+runStakeKeyITNConversion [] skeys [] souts = do
+  let sKeysNum = length skeys
+      sOutsNum = length souts
+
+  equalNumberOfInsOuts sKeysNum sOutsNum
+
+  sequence_ (runSingleITNKeyConversion <$> (take sOutsNum $ repeat Nothing) <*> map Just skeys <*> souts)
+
 runStakeKeyITNConversion vkeys skeys [] [] = do
-  sequence_ (runSingleITNConversion <$> vkeys <*> skeys <*> repeat Nothing)
+  -- Check that an equal number of keys have been entered
+  equalNumKeys
+
+  sequence_ (runSingleITNKeyPairConversion <$> vkeys <*> skeys <*> (take vKeysNum $ repeat Nothing))
+
+ where
+   vKeysNum = length vkeys
+   sKeysNum = length skeys
+
+   equalNumKeys :: ExceptT ShelleyStakeAddressCmdError IO ()
+   equalNumKeys
+     | vKeysNum /= sKeysNum = left $ ShelleyStakeAddressUnequalKeysError vKeysNum sKeysNum
+     | otherwise = return ()
 
 runStakeKeyITNConversion vkeys skeys vouts souts = do
   -- Check the number of verification key file paths, signing key file paths,
-  -- and outputfile paths are all equal
+  -- and output file paths are all equal
   allEqualLength
 
   let outPairs = map Just $ zip vouts souts
-  sequence_ (runSingleITNConversion <$> vkeys <*> skeys <*> outPairs)
+  sequence_ (runSingleITNKeyPairConversion <$> vkeys <*> skeys <*> outPairs)
 
  where
    numVKeys = length vkeys
    numSKeys = length skeys
+   numberOfInputs = numVKeys + numSKeys
+
    numSKeyOuts = length souts
    numVKeyOuts = length vouts
+   numberOfOutputs = numSKeyOuts + numVKeyOuts
 
    allEqualLength :: ExceptT ShelleyStakeAddressCmdError IO ()
    allEqualLength
-     | numVKeys == numSKeys = left $ ShelleyStakeAddressUnequalKeysError numVKeys numSKeys
-     | numVKeyOuts == numSKeyOuts = left $ ShelleyStakeAddressUnequalNumberOfOutputFilesError numVKeyOuts numSKeyOuts
-     | numVKeys < numVKeyOuts = left $ ShelleyStakeAddressLessKeysThanOutsError numVKeys numVKeyOuts
-     | numVKeys > numVKeyOuts = left $ ShelleyStakeAddressMoreKeysThanOutsError numVKeys numVKeyOuts
+     | numVKeys /= numSKeys = left $ ShelleyStakeAddressUnequalKeysError numVKeys numSKeys
+     | numVKeyOuts /= numSKeyOuts = left $ ShelleyStakeAddressUnequalNumberOfOutputFilesError numVKeyOuts numSKeyOuts
+     | numberOfInputs < numberOfOutputs = left $ ShelleyStakeAddressLessKeysThanOutsError numberOfInputs numberOfOutputs
+     | numberOfInputs > numberOfOutputs = left $ ShelleyStakeAddressMoreKeysThanOutsError numberOfInputs numberOfOutputs
      | otherwise = return ()
 
-runSingleITNConversion
+
+runSingleITNKeyConversion
+  :: Maybe VerificationKeyFile
+  -> Maybe SigningKeyFile
+  -> OutputFile
+  -> ExceptT ShelleyStakeAddressCmdError IO ()
+runSingleITNKeyConversion (Just (VerificationKeyFile vk)) Nothing (OutputFile fp) = do
+  bech32publicKey <- firstExceptT ShelleyStakeAddressConvError . newExceptT $ readBech32 vk
+  v@(StakingVerificationKeyShelley (VKey _vkey)) <- hoistEither . first ShelleyStakeAddressConvError $ convertITNverificationKey bech32publicKey
+  firstExceptT (ShelleyStakeAddressWriteVerKeyError fp) . newExceptT $ writeStakingVerificationKey fp v
+
+runSingleITNKeyConversion Nothing (Just (SigningKeyFile sk)) (OutputFile fp) = do
+  bech32privateKey <- firstExceptT ShelleyStakeAddressConvError . newExceptT $ readBech32 sk
+  s@(SigningKeyShelley _sKey) <- hoistEither . first ShelleyStakeAddressConvError $ convertITNsigningKey bech32privateKey
+  firstExceptT (ShelleyStakeAddressWriteSignKeyError fp) . newExceptT $ writeSigningKey fp s
+
+runSingleITNKeyConversion _ _ _ = return () -- This case is currently impossible
+
+runSingleITNKeyPairConversion
   :: VerificationKeyFile
   -> SigningKeyFile
   -> Maybe (OutputFile, OutputFile)
   -> ExceptT ShelleyStakeAddressCmdError IO ()
-runSingleITNConversion (VerificationKeyFile vk) (SigningKeyFile sk) mOutFile = do
-  bech32publicKey <- firstExceptT (ShelleyStakeAddressReadFileError vk) . newExceptT $ readText vk
-  bech32privateKey <- firstExceptT (ShelleyStakeAddressReadFileError sk) . newExceptT $ readText sk
+runSingleITNKeyPairConversion (VerificationKeyFile vk) (SigningKeyFile sk) mOutFile = do
+  bech32publicKey <- firstExceptT ShelleyStakeAddressConvError . newExceptT $ readBech32 vk
+  bech32privateKey <- firstExceptT ShelleyStakeAddressConvError . newExceptT $ readBech32 sk
 
   (signKey, shelleyVerKey) <- checkKeyPair bech32publicKey bech32privateKey
 
@@ -223,7 +288,10 @@ runSingleITNConversion (VerificationKeyFile vk) (SigningKeyFile sk) mOutFile = d
       liftIO $ print shelleyVerKey
       liftIO $ print signKey
 
--- | Checks the verification key corresponds to the given signing key
+-- | Checks that the verification key corresponds to the given signing key
+-- This does not need to be in 'IO' however the 'MonadFail' constraint
+-- imposed by the ITN conversion functions forces us to use 'IO'
+-- in order to report useful errors with 'Either'.
 checkKeyPair
   :: Text
   -- ^ Bech32 public key
@@ -237,3 +305,9 @@ checkKeyPair bech32publicKey bech32privateKey = do
   if DSIGN.deriveVerKeyDSIGN sKey == vkey
   then return (s, v)
   else left $ ShelleyStakeAddressKeyPairError bech32privateKey bech32publicKey
+
+equalNumberOfInsOuts :: Int  -> Int  -> ExceptT ShelleyStakeAddressCmdError IO ()
+equalNumberOfInsOuts ins outs
+     | ins < outs = left $ ShelleyStakeAddressLessKeysThanOutsError ins outs
+     | ins > outs = left $ ShelleyStakeAddressMoreKeysThanOutsError ins outs
+     | otherwise = return ()

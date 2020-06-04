@@ -6,11 +6,13 @@ module Cardano.CLI.Helpers
   , HelpersError(..)
   , convertITNverificationKey
   , convertITNsigningKey
+  , dataPartToBase16
+  , decodeBech32Key
   , ensureNewFile
   , ensureNewFileLBS
   , pPrintCBOR
   , readCBOR
-  , readText
+  , readBech32
   , renderConversionError
   , renderHelpersError
   , serialiseSigningKey
@@ -21,6 +23,8 @@ module Cardano.CLI.Helpers
 
 import           Cardano.Prelude
 
+import           Codec.Binary.Bech32 (DataPart, HumanReadablePart, dataPartToBytes,
+                   dataPartToText)
 import qualified Codec.Binary.Bech32 as Bech32
 import           Codec.CBOR.Pretty (prettyHexEnc)
 import           Codec.CBOR.Read (DeserialiseFailure, deserialiseFromBytes)
@@ -29,6 +33,7 @@ import           Codec.CBOR.Write (toLazyByteString)
 import           Control.Exception (IOException)
 import qualified Control.Exception as Exception
 import           Control.Monad.Trans.Except.Extra (handleIOExceptT, left)
+import qualified Data.ByteString.Base16 as Base16
 import qualified Data.ByteString.Char8 as SC
 import qualified Data.ByteString.Lazy as LB
 import qualified Data.ByteString.Lazy.Char8 as LC
@@ -142,8 +147,13 @@ validateCBOR cborObject bs =
 --------------------------------------------------------------------------------
 
 data ConversionError
-  = Bech32DecodingError !FilePath !Bech32.DecodingError
-  | ITNError !Text
+  = Bech32DecodingError
+      -- ^ Bech32 key
+      !Text
+      !Bech32.DecodingError
+  | Bech32ErrorExtractingByes !DataPart
+  | Bech32ReadError !FilePath !Text
+  | ITNError !HumanReadablePart !DataPart
   | SigningKeyDeserializationError !ByteString
   | VerificationKeyDeserializationError !ByteString
   deriving Show
@@ -151,9 +161,15 @@ data ConversionError
 renderConversionError :: ConversionError -> Text
 renderConversionError err =
   case err of
-    Bech32DecodingError fp decErr ->
-      "Error decoding Bech32 key at:" <> textShow fp <> " Error: " <> textShow decErr
-    ITNError errMessage -> errMessage
+    Bech32DecodingError key decErr ->
+      "Error decoding Bech32 key: " <> key <> " Error: " <> textShow decErr
+    Bech32ErrorExtractingByes dp ->
+      "Unable to extract bytes from: " <> dataPartToText dp
+    Bech32ReadError fp readErr ->
+      "Error reading bech32 key at: " <> textShow fp <> " Error: " <> readErr
+    ITNError hRpart dp ->
+      "Error extracting a ByteString from DataPart: " <> Bech32.dataPartToText dp <>
+      " With human readable part: " <> Bech32.humanReadablePartToText hRpart
     SigningKeyDeserializationError sKey ->
       "Error deserialising signing key: " <> textShow (SC.unpack sKey)
     VerificationKeyDeserializationError vKey ->
@@ -162,7 +178,7 @@ renderConversionError err =
 -- | Convert public ed25519 key to a Shelley stake verification key
 convertITNverificationKey :: Text -> Either ConversionError StakingVerificationKey
 convertITNverificationKey pubKey = do
-  keyBS <- decodeBech32Key pubKey
+  (_, _, keyBS) <- decodeBech32Key pubKey
   case DSIGN.rawDeserialiseVerKeyDSIGN keyBS of
     Just verKey -> Right . StakingVerificationKeyShelley $ Shelley.VKey verKey
     Nothing -> Left $ VerificationKeyDeserializationError keyBS
@@ -170,28 +186,32 @@ convertITNverificationKey pubKey = do
 -- | Convert private ed22519 key to a Shelley signing key.
 convertITNsigningKey :: Text -> Either ConversionError SigningKey
 convertITNsigningKey privKey = do
-  keyBS <- decodeBech32Key privKey
+  (_, _, keyBS) <- decodeBech32Key privKey
   case DSIGN.rawDeserialiseSignKeyDSIGN keyBS of
     Just signKey -> Right $ SigningKeyShelley signKey
     Nothing -> Left $ SigningKeyDeserializationError keyBS
 
 -- | Convert ITN Bech32 public or private keys to 'ByteString's
-decodeBech32Key :: Text -> Either ConversionError ByteString
+decodeBech32Key :: Text -> Either ConversionError (HumanReadablePart, DataPart, ByteString)
 decodeBech32Key key =
   case Bech32.decode key of
-    Left err -> Left . ITNError $ textShow err
-    Right (_, dataPart) -> case Bech32.dataPartToBytes dataPart of
-                             Nothing -> Left $ ITNError "Error extracting a ByteString from a DataPart: \
-                                                      \See bech32 library function: dataPartToBytes"
-                             Just bs -> Right bs
+    Left err -> Left $ Bech32DecodingError key err
+    Right (hRpart, dataPart) -> case Bech32.dataPartToBytes dataPart of
+                             Nothing -> Left $ ITNError hRpart dataPart
+                             Just bs -> Right (hRpart, dataPart, bs)
 
-readText :: FilePath -> IO (Either Text Text)
-readText fp = do
+dataPartToBase16 :: DataPart -> Either ConversionError ByteString
+dataPartToBase16 dp = case dataPartToBytes dp of
+                    Just bs -> Right $ Base16.encode bs
+                    Nothing -> Left $ Bech32ErrorExtractingByes dp
+
+readBech32 :: FilePath -> IO (Either ConversionError Text)
+readBech32 fp = do
   eStr <- Exception.try $ readFile fp
   case eStr of
-    Left e -> return . Left $ handler e
-    Right txt -> return $ Right txt
+    Left e -> return . Left $ Bech32ReadError fp $ handler e
+    Right str -> return . Right . Text.concat $ Text.words str
  where
   handler :: IOException -> Text
-  handler e = Text.pack $ "Cardano.Api.Convert.readText: "
-                     ++ displayException e
+  handler e = Text.pack $ "Cardano.Api.Convert.readBech32: "
+                        ++ displayException e

@@ -220,8 +220,8 @@ pStakeAddress =
 
     pConvertITNKey :: Parser StakeAddressCmd
     pConvertITNKey = StakeKeyITNConversion
-                       <$> some pITNVerificationKeyFile
-                       <*> some pITNSigningKeyFile
+                       <$> many pITNVerificationKeyFile
+                       <*> many pITNSigningKeyFile
                        <*> many pOutputVerificationFile
                        <*> many pOutputSigningFile
 
