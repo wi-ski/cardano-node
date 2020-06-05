@@ -32,9 +32,19 @@ addressFromHex :: Text -> Maybe Address
 addressFromHex txt =
   case Base16.decode (Text.encodeUtf8 txt) of
     (raw, _) ->
-      case Shelley.deserialiseAddr raw of
-        Just addr -> Just $ AddressShelley addr
-        Nothing -> either (const Nothing) (Just . AddressByron) $ Binary.decodeFull' raw
+      tryDeserialise
+        raw
+        [ fmap AddressShelley . Shelley.deserialiseAddr
+        , either (const Nothing) (Just . AddressShelleyReward) . Binary.decodeFull'
+        , either (const Nothing) (Just . AddressByron) . Binary.decodeFull'
+        ]
+  where
+    tryDeserialise :: ByteString -> [ByteString -> Maybe Address] -> Maybe Address
+    tryDeserialise raw (f:fs) =
+      case f raw of
+        Nothing -> tryDeserialise raw fs
+        Just res -> Just res
+    tryDeserialise _ [] = Nothing
 
 addressToHex :: Address -> Text
 addressToHex addr =
